@@ -3,7 +3,15 @@ import testkubeLogo from "./assets/testkube.svg";
 import reactLogo from "./assets/react.svg";
 import "./App.css";
 
-const API_ORIGIN = "http://localhost:8080";
+// Patched for deployment (see ../PATCHES.md): the API base is a build-time
+// setting. A relative base ("/api") makes the browser call the same host it
+// loaded the page from, which is what an ingress needs. The default keeps the
+// upstream behaviour for `npm start` / docker-compose.
+const API_BASE: string =
+  import.meta.env.VITE_API_BASE ?? "http://localhost:8080";
+
+const apiUrl = (path: string) =>
+  new URL(`${API_BASE.replace(/\/$/, "")}/${path}`, window.location.origin);
 
 function App() {
   return (
@@ -57,7 +65,7 @@ function HelloServer() {
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
-    const url = new URL("hello", API_ORIGIN);
+    const url = apiUrl("hello");
     if (name) {
       url.searchParams.append("name", name);
     }
@@ -114,7 +122,7 @@ function HelloDatabase() {
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
-    fetch(`${API_ORIGIN}/hello-pg`)
+    fetch(apiUrl("hello-pg"))
       .then((response) => response.json())
       .then((data) => {
         setResponse(data.message);

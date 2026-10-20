@@ -1,0 +1,31 @@
+# How this app runs on the platform. The only deployment file the team writes.
+# The platform chart (github.com/vengomatto/case-interview, platform/charts/app)
+# renders namespace, quota, network policies, deployments, services, ingress,
+# database and smoke test from it. No Kubernetes knowledge needed.
+#
+# `tag` is changed by CI (deploy PR), never by hand.
+name: testkube-sample
+host: testkube-sample.localhost
+
+components:
+  api:
+    image: ghcr.io/vengomatto/testkube-samples-api
+    tag: local
+    port: 8080
+    path: /api            # served at http://<host>/api/*, prefix stripped before the app
+    health: /hello
+    env:
+      DB_HOST: db
+      DB_PORT: "5432"
+  web:
+    image: ghcr.io/vengomatto/testkube-samples-web
+    tag: local
+    port: 4173
+    path: /
+    health: /
+
+database:
+  enabled: true
+
+smoke:
+  - {component: api, path: /hello-pg, contains: "hello world from postgres"}

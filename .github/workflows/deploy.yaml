@@ -1,0 +1,77 @@
+# Build and propose a deploy. CI never touches the cluster: a deploy is a PR that
+# changes the image tags in deploy/service.yaml; ArgoCD pulls it after merge.
+name: build-and-propose-deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["deploy/**", "**.md"]   # the deploy PR must not retrigger CI
+  pull_request:
+    paths-ignore: ["deploy/**", "**.md"]
+
+env:
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/testkube-samples   # -> ...-api, ...-web
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: "20", cache: npm}
+      - run: npm ci
+      - run: npm run test --workspace apps/api
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions: {contents: read, packages: write}
+    strategy:
+      matrix:
+        component: [api, web]
+    steps:
+      - uses: actions/checkout@v4
+      # QEMU lets the amd64 runner build the arm64 half of the image.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name == 'push'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/${{ matrix.component }}/Dockerfile
+          push: ${{ github.event_name == 'push' }}   # PRs build only
+          # One tag, a manifest list: the same image runs on amd64 and arm64
+          # (Apple Silicon laptops, Graviton). Immutable tag = commit SHA.
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ env.IMAGE_PREFIX }}-${{ matrix.component }}:${{ github.sha }}
+          provenance: false
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+
+  propose-deploy:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions: {contents: write, pull-requests: write}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bump image tags and open a PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sed -i -E "s|^(    tag: ).*|\1${GITHUB_SHA}|" deploy/service.yaml
+          branch="deploy/${GITHUB_SHA::7}"
+          git config user.name  "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+          git checkout -b "$branch"
+          git commit -am "chore(deploy): ${GITHUB_SHA::7}"
+          git push origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "chore(deploy): ${GITHUB_SHA::7}" \
+            --body "Image tags built from ${GITHUB_SHA}. Merge to deploy: ArgoCD pulls the change."
