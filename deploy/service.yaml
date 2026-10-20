@@ -3,14 +3,15 @@
 # renders namespace, quota, network policies, deployments, services, ingress,
 # database and smoke test from it. No Kubernetes knowledge needed.
 #
-# `tag` is changed by CI (deploy PR), never by hand.
+# `tag` is the commit SHA of the image CI built and pushed to GHCR. CI rewrites it in a
+# deploy PR; never edit it by hand. `unreleased` means no image has been proposed yet.
 name: testkube-sample
 host: testkube-sample.localhost
 
 components:
   api:
     image: ghcr.io/vengomatto/testkube-samples-api
-    tag: local
+    tag: unreleased
     port: 8080
     path: /api            # served at http://<host>/api/*, prefix stripped before the app
     health: /hello
@@ -19,7 +20,7 @@ components:
       DB_PORT: "5432"
   web:
     image: ghcr.io/vengomatto/testkube-samples-web
-    tag: local
+    tag: unreleased
     port: 4173
     path: /
     health: /
