@@ -1,5 +1,7 @@
-# Build and propose a deploy. CI never touches the cluster: a deploy is a PR that
-# changes the image tags in deploy/service.yaml; ArgoCD pulls it after merge.
+# Build, verify, and deploy by PR. CI never touches the cluster: a deploy is a PR that
+# changes the image tags in deploy/service.yaml, merged automatically once both images
+# are verified; Argo CD pulls the change after the merge. The PR stays as audit trail
+# and as the unit to revert.
 name: build-and-propose-deploy
 
 on:
@@ -9,6 +11,12 @@ on:
     paths-ignore: ["deploy/**", "**.md"]   # the deploy PR must not retrigger CI
   pull_request:
     paths-ignore: ["deploy/**", "**.md"]
+
+# One deploy at a time per branch; a newer push supersedes an older run, so an old
+# commit can never be deployed after a newer one.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/testkube-samples   # -> ...-api, ...-web
@@ -54,19 +62,60 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.component }}
           cache-to: type=gha,mode=max,scope=${{ matrix.component }}
 
-  propose-deploy:
+  deploy:
     needs: build
-    if: github.event_name != 'pull_request'
+    # Only the default branch may deploy. Without this, anyone who can run this workflow on a
+    # branch (workflow_dispatch) would ship that branch's build to main through the auto-merge.
+    if: github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch
     runs-on: ubuntu-latest
-    permissions: {contents: write, pull-requests: write}
+    permissions: {contents: write, pull-requests: write, packages: read}
     steps:
+      # Branch from the latest main, not from the commit that triggered the run, so two
+      # deploy PRs in a row do not conflict on the same tag lines.
       - uses: actions/checkout@v4
-      - name: Bump image tags and open a PR
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The gate. Without a human review, the check is: both images exist and are
+      # manifest lists covering amd64 and arm64. A single-arch image would crash on an
+      # arm64 node with `exec format error`, so it must not be deployed.
+      - name: Verify images
         run: |
           set -euo pipefail
+          for c in api web; do
+            image="${IMAGE_PREFIX}-${c}:${GITHUB_SHA}"
+            platforms=$(docker buildx imagetools inspect "$image" --raw \
+              | jq -r '.manifests[]?.platform | select(.os != null) | "\(.os)/\(.architecture)"' | sort -u)
+            echo "$image: $(echo "$platforms" | tr '\n' ' ')"
+            echo "$platforms" | grep -qx "linux/amd64" || { echo "::error::$image has no linux/amd64"; exit 1; }
+            echo "$platforms" | grep -qx "linux/arm64" || { echo "::error::$image has no linux/arm64"; exit 1; }
+          done
+
+      - name: Bump image tags, open the PR, merge it
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Optional repository variables (Settings > Variables): links shown in the PR comment.
+          ARGOCD_URL: ${{ vars.ARGOCD_URL }}
+          PLATFORM_DOCS_URL: ${{ vars.PLATFORM_DOCS_URL }}
+        run: |
+          set -euo pipefail
+          old_tag=$(awk '$1=="tag:"{print $2; exit}' deploy/service.yaml)
+          service=$(awk '$1=="name:"{print $2; exit}' deploy/service.yaml)
           sed -i -E "s|^(    tag: ).*|\1${GITHUB_SHA}|" deploy/service.yaml
+
+          # Nothing to do if this SHA is already what main deploys.
+          if git diff --quiet; then echo "tags already at ${GITHUB_SHA}"; exit 0; fi
+
+          # Only deploy/service.yaml may change: this job must never ship anything else.
+          changed=$(git diff --name-only)
+          [ "$changed" = "deploy/service.yaml" ] || { echo "::error::unexpected changes: $changed"; exit 1; }
+
           branch="deploy/${GITHUB_SHA::7}"
           git config user.name  "ci-bot"
           git config user.email "ci-bot@users.noreply.github.com"
@@ -75,4 +124,52 @@ jobs:
           git push origin "$branch"
           gh pr create --base main --head "$branch" \
             --title "chore(deploy): ${GITHUB_SHA::7}" \
-            --body "Image tags built from ${GITHUB_SHA}. Merge to deploy: ArgoCD pulls the change."
+            --body "Image tags built from ${GITHUB_SHA}. Both images verified for linux/amd64 and linux/arm64. Merged automatically; Argo CD pulls the change. To roll back, revert this PR."
+
+          # A comment on the PR, where developers look: what changed, where to watch it, how to undo it.
+          short=${GITHUB_SHA::7}
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          {
+            echo "### Deploy ${short}"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | [\`${short}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}) |"
+            echo "| Previous tag | \`${old_tag}\` |"
+            echo "| New tag | \`${GITHUB_SHA}\` |"
+            echo "| Images | \`${IMAGE_PREFIX}-api\`, \`${IMAGE_PREFIX}-web\` |"
+            echo "| Verified | both images cover linux/amd64 and linux/arm64 |"
+            echo "| Pipeline run | ${run_url} |"
+            if [ -n "${ARGOCD_URL:-}" ]; then
+              echo "| Watch the rollout | ${ARGOCD_URL}/applications/argocd/${service} |"
+            fi
+            echo
+            if [ "$old_tag" = "unreleased" ]; then
+              echo "**Rollback:** this is the first release, so there is no earlier image to return to."
+            else
+              echo "**Rollback:** after this PR is merged, open it and click **Revert**. Merge the revert PR."
+              echo "That restores \`${old_tag}\` in \`deploy/service.yaml\`; the cluster syncs it and re-runs the smoke test."
+              echo "It does not undo database migrations or changes made in other repositories."
+            fi
+            if [ -n "${PLATFORM_DOCS_URL:-}" ]; then
+              echo "Full procedure: ${PLATFORM_DOCS_URL}#rollback"
+            fi
+          } > "${RUNNER_TEMP}/deploy-comment.md"
+          gh pr comment "$branch" --body-file "${RUNNER_TEMP}/deploy-comment.md"
+
+          # Works with or without branch protection on main:
+          #   1. no review rules      -> merged now
+          #   2. reviews required     -> merge queued until a reviewer approves (needs
+          #                              "Allow auto-merge" in the repository settings)
+          #   3. neither works        -> PR left open for a human; the job stays green
+          # Required status checks would stall this PR: events from GITHUB_TOKEN do not
+          # trigger workflows and deploy/** is path-ignored (see docs/design.md, 8.5).
+          if gh pr merge "$branch" --squash --delete-branch; then
+            echo "merged $branch"
+          elif gh pr merge "$branch" --squash --delete-branch --auto; then
+            echo "::notice::merge queued for $branch: waiting for required reviews"
+            gh pr comment "$branch" --body "Merge queued: it completes automatically once this PR is approved. Approve it to deploy."
+          else
+            echo "::warning::deploy PR left open for review: $(gh pr view "$branch" --json url -q .url)"
+            gh pr comment "$branch" --body "Waiting for review: this repository requires an approval on main. Approve and merge this PR to deploy; Argo CD syncs after the merge."
+          fi
