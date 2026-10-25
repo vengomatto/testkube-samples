@@ -4,6 +4,10 @@
 # and as the unit to revert.
 name: build-and-propose-deploy
 
+# Least privilege by default: each job asks for what it needs.
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:          # manual run on main, e.g. to propose a deploy without a code change
   push:
@@ -58,6 +62,8 @@ jobs:
           # (Apple Silicon laptops, Graviton). Immutable tag = commit SHA.
           platforms: linux/amd64,linux/arm64
           tags: ${{ env.IMAGE_PREFIX }}-${{ matrix.component }}:${{ github.sha }}
+          # Links the package to this repository, so it inherits the repository's access rules.
+          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           provenance: false
           cache-from: type=gha,scope=${{ matrix.component }}
           cache-to: type=gha,mode=max,scope=${{ matrix.component }}
@@ -66,7 +72,7 @@ jobs:
     needs: build
     # Only the default branch may deploy. Without this, anyone who can run this workflow on a
     # branch (workflow_dispatch) would ship that branch's build to main through the auto-merge.
-    if: github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch
+    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     permissions: {contents: write, pull-requests: write, packages: read}
     steps:
@@ -121,10 +127,14 @@ jobs:
           git config user.email "ci-bot@users.noreply.github.com"
           git checkout -b "$branch"
           git commit -am "chore(deploy): ${GITHUB_SHA::7}"
-          git push origin "$branch"
-          gh pr create --base main --head "$branch" \
-            --title "chore(deploy): ${GITHUB_SHA::7}" \
-            --body "Image tags built from ${GITHUB_SHA}. Both images verified for linux/amd64 and linux/arm64. Merged automatically; Argo CD pulls the change. To roll back, revert this PR."
+          # A re-run after a partial run creates a new commit for the same branch name. The branch
+          # belongs to this job, so overwrite it.
+          git push --force origin "$branch"
+          if [ "$(gh pr list --head "$branch" --state open --json number --jq length)" = "0" ]; then
+            gh pr create --base "${GITHUB_REF_NAME}" --head "$branch" \
+              --title "chore(deploy): ${GITHUB_SHA::7}" \
+              --body "Image tags built from ${GITHUB_SHA}. Every image verified for linux/amd64 and linux/arm64. Merged automatically; Argo CD pulls the change. To roll back, revert this PR."
+          fi
 
           # A comment on the PR, where developers look: what changed, where to watch it, how to undo it.
           short=${GITHUB_SHA::7}
@@ -163,8 +173,14 @@ jobs:
           #                              "Allow auto-merge" in the repository settings)
           #   3. neither works        -> PR left open for a human; the job stays green
           # Required status checks would stall this PR: events from GITHUB_TOKEN do not
-          # trigger workflows and deploy/** is path-ignored (see docs/design.md, 8.5).
-          if gh pr merge "$branch" --squash --delete-branch; then
+          # trigger workflows and deploy/** is path-ignored.
+          merged=false
+          for attempt in 1 2 3; do
+            # Mergeability is computed asynchronously, right after the PR is created.
+            if gh pr merge "$branch" --squash --delete-branch; then merged=true; break; fi
+            sleep 5
+          done
+          if [ "$merged" = true ]; then
             echo "merged $branch"
           elif gh pr merge "$branch" --squash --delete-branch --auto; then
             echo "::notice::merge queued for $branch: waiting for required reviews"
