@@ -11,7 +11,7 @@ host: testkube-sample.localhost
 components:
   api:
     image: ghcr.io/vengomatto/testkube-samples-api
-    tag: 8ec38c689cadc233beda0ec52b141e9546a8b791
+    tag: 8e759c35e445a29c9841ad565f1b12fe81d11d2e
     port: 8080
     path: /api            # served at http://<host>/api/*, prefix stripped before the app
     health: /hello
@@ -20,7 +20,7 @@ components:
       DB_PORT: "5432"
   web:
     image: ghcr.io/vengomatto/testkube-samples-web
-    tag: 8ec38c689cadc233beda0ec52b141e9546a8b791
+    tag: 8e759c35e445a29c9841ad565f1b12fe81d11d2e
     port: 4173
     path: /
     health: /
