@@ -55,9 +55,15 @@ This repo carries its own deploy flow. You do not need to know Kubernetes.
 
 | You want to | You do |
 |---|---|
-| Ship a change | Merge to `main`. CI builds multi-arch images and opens a `chore(deploy)` PR. Merge it: ArgoCD deploys. |
+| Ship a change | Open a PR (CI runs the tests and builds both images without pushing), merge it. After the merge, CI builds multi-arch images, checks that both architectures exist, and merges a `chore(deploy)` PR for you. Argo CD deploys. To roll back, revert that PR. |
 | Change a port, path or env var | Edit `deploy/service.yaml` |
 | Run it locally without a cluster | `docker compose up` |
+
+Work on a branch and open a PR even when nobody reviews it. The PR run proves the tests pass and both
+images build before anything reaches `main`, and it keeps one reviewable unit per change.
+
+To roll back, click **Revert** on the deploy PR and merge the revert PR (the PR comment lists the previous tag).
+The full procedure is the **Rollback** section of the platform repo's `docs/runbook.md`.
 
 `deploy/service.yaml` is rendered by the platform chart in
 [`vengomatto/case-interview`](https://github.com/vengomatto/case-interview).
